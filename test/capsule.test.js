@@ -20,7 +20,7 @@ test('owner setup requires a secret and signed-in account; all private operation
   await assert.rejects(f.query('metadata'), /private/);
   await f.mutate('claim', ['setup-secret']);
   await assert.rejects(f.mutate('claim', ['setup-secret'], signedIn('attacker')), /already/);
-  assert.deepEqual(await f.query('access', [], signedIn('attacker')), { configured: true, allowed: false });
+  assert.deepEqual(await f.query('access', [], signedIn('attacker')), { configured: true, allowed: false, userId: 'attacker' });
   for (const auth of [guest(), signedIn('attacker')]) {
     await assert.rejects(f.query('metadata', [], auth));
     await assert.rejects(f.query('events', [{ pagination: { cursor: null, numItems: 200 } }], auth));
@@ -85,6 +85,24 @@ test('full batches stay within Lakebed scan budgets; history reads are paginated
   assert.equal(all.length, 280); assert.equal(new Set(all.map(e => e.id)).size, 280);
   await assert.rejects(f.query('events', [{ pagination: { cursor: null, numItems: 1001 } }]), /page size/);
   assert.equal((await f.query('metadata')).calls, 280);
+});
+test('900-event pages leave quota headroom for ownership and 40 machine profiles', async () => {
+  const f = fixture(); await f.mutate('claim', ['setup-secret']);
+  for (let i = 0; i < 925; i += 40) {
+    await f.ingest(body(Array.from({ length: Math.min(40, 925 - i) }, (_, j) => event('large-' + (i + j)))));
+  }
+  for (let i = 0; i < 40; i++) {
+    const token = i ? 'slop_' + String(i).padStart(43, 'b') : f.env.BOOTSTRAP_UPLOAD_TOKEN;
+    if (i) await f.mutate('addToken', ['Machine ' + i, token]);
+    await f.ingest({ machine: { id: i ? 'machine-' + i : 'laptop', name: 'Machine ' + i },
+      events: [], billingDefaults: { 'openai-codex': 'subscription' } }, token);
+  }
+  const first = await f.query('events', [{ pagination: { cursor: null, numItems: 900 } }]);
+  assert.equal(first.page.length, 900); assert.equal(first.isDone, false);
+  const second = await f.query('events', [{ pagination: { cursor: first.continueCursor, numItems: 900 } }]);
+  assert.equal(second.page.length, 25); assert.equal(second.isDone, true);
+  assert.equal(new Set([...first.page, ...second.page].map(e => e.id)).size, 925);
+  await assert.rejects(f.query('events', [{ pagination: { cursor: null, numItems: 901 } }]), /page size/);
 });
 test('compact storage is lossless and unknown accounting remains unknown', () => {
   const e = { ...event(), machine: 'laptop', machineName: 'Laptop' };

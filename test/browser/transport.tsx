@@ -8,13 +8,17 @@ function useRevision() {
   return revision;
 }
 async function rpc(kind: string, name: string, args: unknown[]) {
-  const response = await fetch('/rpc', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ kind, name, args }) });
+  const response = await fetch('/rpc', { method: 'POST', headers: { 'Content-Type': 'application/json', 'X-Test-User': sessionStorage.getItem('test-auth-user') ?? 'owner' }, body: JSON.stringify({ kind, name, args }) });
   const result = await response.json();
   if (!response.ok) throw new Error(result.error);
   return result;
 }
-export const useAuth = () => ({ isLoading: false, isSignedIn: true, error: null, displayName: 'Test owner' });
-export const signOut = async () => {};
+export function useAuth() {
+  useRevision();
+  const user = sessionStorage.getItem('test-auth-user') ?? 'owner';
+  return { isLoading: false, isSignedIn: user !== 'signed-out', userId: user === 'signed-out' ? null : user, error: null, displayName: 'Test owner' };
+}
+export const signOut = async () => { sessionStorage.setItem('test-auth-user', 'signed-out'); window.dispatchEvent(new Event('refresh')); };
 export const retryAuth = async () => {};
 export const SignInWithGoogle = () => <button>Sign in with Google</button>;
 export const Router = ({ children }: { children: ComponentChildren }) => <>{children}</>;
@@ -26,7 +30,7 @@ export function useLocation() {
   useEffect(() => { const changed = () => setPathname(location.pathname); window.addEventListener('popstate', changed); return () => window.removeEventListener('popstate', changed); }, []);
   return { pathname };
 }
-export function createClient<T>() {
+export function createClient<_T>() {
   return {
     useQuery(name: string) {
       const revision = useRevision(); const [data, setData] = useState<unknown>();

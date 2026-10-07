@@ -4,6 +4,9 @@ import type { ComponentChildren } from 'preact';
 import type app from '../server/index.ts';
 import { billingTypes, classify, group, metrics, tokenBreakdown, tokenCategories, type Settings, type StoredEvent } from '../shared/usage.ts';
 import styles from './style.ts';
+import { clearHistoryCache, readHistoryCache, writeHistoryCache, type HistorySnapshot } from './history-cache.ts';
+
+async function leaveAccount() { clearHistoryCache(); await signOut(); }
 
 const client = createClient<typeof app>();
 const integer = (n: number) => new Intl.NumberFormat('en-US').format(n);
@@ -26,13 +29,15 @@ function Login({ children }: { children: ComponentChildren }) {
   return <div className="login"><section className="login-card"><div className="mark">π</div><p className="eyebrow">SLOP STATISTICS</p><h1>Your agent usage.<br />In one place.</h1>{children}</section></div>;
 }
 function AccountGate() {
+  const auth = useAuth();
   const access = client.useQuery('access');
   const claim = client.useMutation('claim');
   const [key, setKey] = useState('');
   const [error, setError] = useState('');
   const [busy, setBusy] = useState(false);
-  if (!access) return <Login><p>Checking dashboard access…</p></Login>;
-  if (access.allowed) return <Dashboard />;
+  useEffect(() => { if (access && access.userId === auth.userId && !access.allowed) clearHistoryCache(); }, [access, auth.userId]);
+  if (!access || access.userId !== auth.userId) return <Login><p>Checking dashboard access…</p></Login>;
+  if (access.allowed) return <Dashboard key={auth.userId ?? ''} />;
   return <Login>{access.configured ? <p>This dashboard is private to its owner. You are signed in with a different account.</p> : <>
     <p>Bind this private dashboard to your Google account with the setup key in <code>.local/owner-setup-key</code>. Nobody can claim it without that key.</p>
     <form onSubmit={async event => {
@@ -40,10 +45,11 @@ function AccountGate() {
       try { await claim(key); setKey(''); } catch (e) { setError(errorMessage(e)); } finally { setBusy(false); }
     }}><label>Owner setup key<input type="password" required value={key} onInput={e => setKey(e.currentTarget.value)} autoComplete="off" /></label>
       <button className="primary" disabled={busy}>Bind my account</button></form>
-  </>}{error && <p role="alert">{error}</p>}<button onClick={() => void signOut()}>Sign out</button></Login>;
+  </>}{error && <p role="alert">{error}</p>}<button onClick={() => void leaveAccount()}>Sign out</button></Login>;
 }
 export function App() {
   const auth = useAuth();
+  useEffect(() => { if (!auth.isLoading && (!auth.isSignedIn || auth.error)) clearHistoryCache(); }, [auth.isLoading, auth.isSignedIn, auth.error]);
   return <><style>{styles}</style><Router>{auth.isLoading ? <Login><p>Checking session…</p></Login> :
     auth.isSignedIn && !auth.error ? <AccountGate /> : <Login><p>A private dashboard for Pi tokens and estimated usage value. Lakebed provides Google sign-in; no OAuth credentials are needed.</p>
       {auth.error && <p role="alert">{auth.error}</p>}<SignInWithGoogle className="primary" />
@@ -137,13 +143,27 @@ function Dashboard() {
   const location = useLocation();
   const view = views.find(v => location.pathname === '/' + v) ?? 'overview';
   const metadata = client.useQuery('metadata');
-  const records = client.usePaginatedQuery('events', {}, { initialNumItems: 200 });
+  const records = client.usePaginatedQuery('events', {}, { initialNumItems: 900 });
+  const [snapshot, setSnapshot] = useState<HistorySnapshot | undefined>(() => readHistoryCache(auth.userId));
+  const incomplete = !metadata || !records.isDone || records.page.length !== metadata.calls;
+  const usingCache = incomplete && Boolean(snapshot);
+  const sourceEvents = usingCache ? snapshot!.events : records.page;
+  const settings = metadata?.settings ?? snapshot?.settings;
   useEffect(() => { if (records.continueCursor && !records.isDone) records.loadMore(); }, [records.continueCursor, records.isDone]);
+  useEffect(() => {
+    if (incomplete || !metadata) return;
+    // The SDK combines pages into a new array each render; only save a changed snapshot.
+    if (snapshot?.settings === metadata.settings && snapshot.events.length === records.page.length &&
+        snapshot.events.every((event, i) => event === records.page[i])) return;
+    const complete = { events: records.page, settings: metadata.settings, savedAt: Date.now() };
+    setSnapshot(complete);
+    writeHistoryCache(auth.userId, complete);
+  }, [incomplete, records.page, metadata, auth.userId, snapshot]);
   const [metric, setMetric] = useState('tokens');
   const [period, setPeriod] = useState('30');
   const [filters, setFilters] = useState<Record<string, string>>({});
   const [selectedSession, setSelectedSession] = useState('');
-  const events = useMemo(() => metadata ? records.page.map(e => classify(e, metadata.settings)) : [], [records.page, metadata]);
+  const events = useMemo(() => settings ? sourceEvents.map(e => classify(e, settings)) : [], [sourceEvents, settings]);
   const filtered = useMemo(() => {
     const today = new Date().toISOString().slice(0, 10);
     const from = period === 'all' ? '' : period === 'month' ? today.slice(0, 7) + '-01' : new Date(Date.parse(today) - (Number(period) - 1) * 86400000).toISOString().slice(0, 10);
@@ -168,7 +188,6 @@ function Dashboard() {
     machine: group(events, e => e.machine, e => e.machineName).map(e => [e.key, e.name]),
     billing: billingTypes.map(e => [e, e])
   };
-  const incomplete = !records.isDone || records.page.length !== (metadata?.calls ?? 0);
   function exportData() {
     const url = URL.createObjectURL(new Blob([JSON.stringify({ events: records.page, settings: metadata?.settings }, null, 2)], { type: 'application/json' }));
     const link = document.createElement('a'); link.href = url; link.download = 'slop-statistics.json'; link.click(); URL.revokeObjectURL(url);
@@ -176,11 +195,13 @@ function Dashboard() {
   const detail = filtered.filter(e => sessionKey(e) === selectedSession);
   return <><aside><div className="brand"><span className="mark">π</span><span>slop statistics<br /><small>PI USAGE WORKSPACE</small></span></div>
     <nav aria-label="Dashboard">{views.map(v => <Link key={v} to={'/' + v} className={view === v ? 'active' : ''}>{v[0].toUpperCase() + v.slice(1)}</Link>)}</nav>
-    <div className="account">{auth.displayName}<button onClick={() => void signOut()}>Sign out</button><p><small>Metadata only. Conversations stay local.</small></p></div></aside>
-    <main className="dashboard"><header className="topbar"><span>Workspace / {view}</span><span>{incomplete ? 'Loading complete history…' : 'Live · Lakebed free'}</span></header>
+    <div className="account">{auth.displayName}<button onClick={() => void leaveAccount()}>Sign out</button><p><small>Metadata only. Conversations stay local.</small></p></div></aside>
+    <main className="dashboard"><header className="topbar"><span>Workspace / {view}</span><span>{incomplete ? (usingCache ? 'Cached · refreshing…' : 'Loading complete history…') : 'Live · Lakebed free'}</span></header>
       <div className="content"><div className="heading"><div><p className="eyebrow">YOUR PI WORKSPACE</p><h1>{headings[view][0]}</h1><p>{headings[view][1]}</p></div>
         <button onClick={() => setMetric(metric === 'tokens' ? 'value' : 'tokens')}>{metric === 'tokens' ? 'Show money' : 'Show tokens'}</button></div>
-      {incomplete && <div className="note" role="status">Loading {integer(records.page.length)} of {integer(metadata?.calls ?? 0)} records. Totals below are partial until loading finishes.</div>}
+      {incomplete && <div className="note" role="status">{usingCache ? <>
+        Showing cached totals from {new Date(snapshot!.savedAt).toLocaleString()}; refreshing in the background. These are not live totals yet.
+      </> : <>Loading {integer(records.page.length)} of {integer(metadata?.calls ?? 0)} records. Totals below are partial until loading finishes.</>}</div>}
       {view === 'settings' ? metadata && <SettingsPage metadata={metadata} /> : <>
         <div className="filters"><label>Period<select aria-label="Period" value={period} onChange={e => setPeriod(e.currentTarget.value)}>
           <option value="7">Last 7 days</option><option value="30">Last 30 days</option><option value="month">This month</option><option value="all">All time / custom</option></select></label>

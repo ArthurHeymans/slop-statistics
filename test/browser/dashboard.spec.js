@@ -3,7 +3,7 @@ import { build } from 'esbuild';
 import { createServer } from 'node:http';
 import { once } from 'node:events';
 import { resolve } from 'node:path';
-import { fixture } from '../lakebed-helpers.js';
+import { fixture, guest, signedIn } from '../lakebed-helpers.js';
 import { event } from '../fixtures.js';
 
 let bundle;
@@ -21,12 +21,16 @@ async function startApp() {
     });
     await backend.ingest({ machine: { id: 'laptop', name: 'Laptop' }, events });
   }
+  const eventRequests = [];
   const server = createServer(async (req, res) => {
     try {
       if (req.url === '/rpc') {
         const chunks = []; for await (const chunk of req) chunks.push(chunk);
         const { kind, name, args } = JSON.parse(Buffer.concat(chunks).toString());
-        const result = kind === 'query' ? await backend.query(name, args) : await backend.mutate(name, args);
+        if (kind === 'query' && name === 'events') eventRequests.push(args[0].pagination);
+        const user = String(req.headers['x-test-user'] ?? 'owner');
+        const auth = user === 'signed-out' ? guest() : signedIn(user);
+        const result = kind === 'query' ? await backend.query(name, args, auth) : await backend.mutate(name, args, auth);
         res.setHeader('Content-Type', 'application/json'); res.end(JSON.stringify(result ?? null)); return;
       }
       if (req.url === '/app.js') { res.setHeader('Content-Type', 'text/javascript'); res.end(js); return; }
@@ -34,18 +38,19 @@ async function startApp() {
       res.end('<!doctype html><html><head><meta name="viewport" content="width=device-width,initial-scale=1"></head><body><div id="app"></div><script type="module" src="/app.js"></script></body></html>');
     } catch (e) { res.writeHead(400, { 'Content-Type': 'application/json' }); res.end(JSON.stringify({ error: e.message })); }
   });
-  return { server, backend };
+  return { server, backend, eventRequests };
 }
-let server, backend;
+let server, backend, eventRequests;
 test.beforeEach(async ({ page }) => {
-  ({ server, backend } = await startApp());
+  ({ server, backend, eventRequests } = await startApp());
   server.listen(0, '127.0.0.1'); await once(server, 'listening');
   await page.goto(`http://127.0.0.1:${server.address().port}`);
   await expect(page.getByText('Live · Lakebed free', { exact: true })).toBeVisible();
 });
 test.afterEach(async () => { await new Promise(resolve => { server.close(resolve); server.closeAllConnections(); }); });
 
-test('all views show complete paginated totals; session details and XSS-safe model labels render', async ({ page }) => {
+test('all views show complete totals in one large page; session details and XSS-safe labels render', async ({ page }) => {
+  expect(eventRequests).toEqual([{ cursor: null, numItems: 900 }]);
   await expect(page.locator('.kpis')).toContainText('260 records');
   await expect(page.locator('.kpis')).toContainText('46.8K');
   for (const view of ['Projects', 'Models', 'Machines', 'Sessions']) {
@@ -138,6 +143,38 @@ test('settings save real capsule mutations: aliases, billing, fees and revocable
   await page.getByRole('link', { name: 'Projects', exact: true }).click();
   await expect(page.locator('tbody tr')).toHaveCount(1);
   await expect(page.locator('.kpi').filter({ hasText: 'Estimated usage value' }).locator('.value')).toHaveText('$5.20');
+});
+test('reload shows a complete cached snapshot while refreshing, then replaces it and clears on logout', async ({ page }) => {
+  const cachedKeys = () => page.evaluate(() => Object.keys(sessionStorage).filter(key => key.startsWith('slop-statistics:history:')).length);
+  await expect.poll(cachedKeys).toBe(1);
+  await backend.ingest({ machine: { id: 'laptop', name: 'Laptop' }, events: [event('new-after-cache', 'github.com/user/alpha', new Date().toISOString())] });
+  let release;
+  const pending = new Promise(resolve => { release = resolve; });
+  await page.route('**/rpc', async route => {
+    if (route.request().postDataJSON()?.name === 'events') await pending;
+    await route.continue();
+  });
+  try {
+    await page.reload();
+    await expect(page.getByText('Cached · refreshing…', { exact: true })).toBeVisible();
+    await expect(page.locator('.kpis')).toContainText('260 records');
+    await expect(page.getByRole('button', { name: 'Export hosted metadata' })).toBeDisabled();
+    release();
+    await expect(page.getByText('Live · Lakebed free', { exact: true })).toBeVisible();
+    await expect(page.locator('.kpis')).toContainText('261 records');
+    await expect(page.getByRole('button', { name: 'Export hosted metadata' })).toBeEnabled();
+    await page.getByRole('button', { name: 'Sign out', exact: true }).click();
+    await expect(page.getByRole('button', { name: 'Sign in with Google' })).toBeVisible();
+    expect(await cachedKeys()).toBe(0);
+  } finally { release(); await page.unroute('**/rpc'); }
+});
+test('a different account cannot display the previous owner’s browser cache', async ({ page }) => {
+  await expect.poll(() => page.evaluate(() => Object.keys(sessionStorage).some(key => key.startsWith('slop-statistics:history:')))).toBe(true);
+  await page.evaluate(() => sessionStorage.setItem('test-auth-user', 'attacker'));
+  await page.reload();
+  await expect(page.getByText('This dashboard is private to its owner.', { exact: false })).toBeVisible();
+  await expect(page.locator('.kpis')).toHaveCount(0);
+  await expect.poll(() => page.evaluate(() => Object.keys(sessionStorage).some(key => key.startsWith('slop-statistics:history:')))).toBe(false);
 });
 test('mobile layout fits and filter navigation remains usable', async ({ page }) => {
   await page.setViewportSize({ width: 390, height: 844 });

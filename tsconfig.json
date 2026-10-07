@@ -5,5 +5,5 @@
     "allowJs": true, "checkJs": false, "strict": true,
     "noEmit": true, "skipLibCheck": true, "types": ["node"]
   },
-  "include": ["extension/**/*.ts", "collector/**/*.js", "shared/**/*.js", "capsule/**/*.ts", "capsule/**/*.tsx"]
+  "include": ["extension/**/*.ts", "collector/**/*.js", "shared/**/*.js", "capsule/**/*.ts", "capsule/**/*.tsx", "test/browser/transport.tsx"]
 }

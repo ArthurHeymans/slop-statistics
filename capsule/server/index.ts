@@ -24,7 +24,7 @@ export default capsule({
     access: query(async ctx => {
       const account = ctx.auth.requireSignedIn();
       const owner = await ctx.db.owner.withIndex('by_creation').first();
-      return { configured: Boolean(owner), allowed: owner?.subject === account.userId };
+      return { configured: Boolean(owner), allowed: owner?.subject === account.userId, userId: account.userId };
     }),
     metadata: query(async ctx => {
       const owner = await requireOwner(ctx);
@@ -41,7 +41,7 @@ export default capsule({
     events: query(async (ctx, args: { pagination: PaginationOptions }) => {
       await requireOwner(ctx);
       const pagination = args?.pagination;
-      if (!pagination || !Number.isSafeInteger(pagination.numItems) || pagination.numItems < 1 || pagination.numItems > 200) throw new Error('Invalid page size.');
+      if (!pagination || !Number.isSafeInteger(pagination.numItems) || pagination.numItems < 1 || pagination.numItems > 900) throw new Error('Invalid page size.');
       const machines = await ctx.db.machines.withIndex('by_creation').take(40);
       const defaults = new Map(machines.map(row => [String(row.key), readDefaults(row.billing)]));
       const result = await ctx.db.events.withIndex('by_at').order('desc').paginate(pagination);
