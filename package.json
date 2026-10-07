@@ -1,0 +1,51 @@
+{
+  "name": "slop-statistics",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Private Pi usage dashboard and metadata-only collector",
+  "license": "(MIT OR Apache-2.0)",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/ArthurHeymans/slop-statistics.git"
+  },
+  "keywords": ["pi-package", "pi-extension", "usage", "dashboard", "lakebed"],
+  "type": "module",
+  "engines": {
+    "node": ">=24.0.0"
+  },
+  "scripts": {
+    "setup": "node scripts/setup.js",
+    "start": "lakebed dev capsule",
+    "dev": "lakebed dev capsule",
+    "build": "lakebed build capsule",
+    "deploy": "lakebed deploy capsule",
+    "inspect": "node scripts/inspect.js",
+    "test": "node --test test/*.test.js",
+    "test:browser": "playwright test",
+    "check": "tsc --noEmit",
+    "collector": "node collector/cli.js",
+    "screenshot": "node scripts/screenshot.js"
+  },
+  "pi": {
+    "extensions": [
+      "./extension/index.ts"
+    ]
+  },
+  "peerDependencies": {
+    "@earendil-works/pi-coding-agent": "*"
+  },
+  "peerDependenciesMeta": {
+    "@earendil-works/pi-coding-agent": {
+      "optional": true
+    }
+  },
+  "devDependencies": {
+    "@earendil-works/pi-coding-agent": "^0.99.1",
+    "@playwright/test": "^1.63.0",
+    "@types/node": "^24.0.0",
+    "esbuild": "^0.28.2",
+    "lakebed": "^0.0.39",
+    "preact": "^10.29.8",
+    "typescript": "^5.9.3"
+  }
+}

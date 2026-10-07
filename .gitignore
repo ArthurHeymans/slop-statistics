@@ -1,0 +1,16 @@
+node_modules/
+data/
+.local/
+.env
+.env.*
+.envrc
+*.sqlite
+*.sqlite-shm
+*.sqlite-wal
+collector.json
+test-results/
+playwright-report/
+.lakebed/
+# Local deployment binding and secrets must not follow public clones.
+/capsule/lakebed.json
+.env.lakebed.server

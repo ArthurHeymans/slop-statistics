@@ -1,0 +1,11 @@
+Slop Statistics is copyright (c) 2026 Arthur Heymans.
+
+The dashboard, Pi extension, and collector are dual-licensed, at your option,
+under either:
+
+- Apache License, Version 2.0 (LICENSE-APACHE)
+- MIT License (LICENSE-MIT)
+
+SPDX-License-Identifier: MIT OR Apache-2.0
+
+Third-party dependencies retain their own licenses.
