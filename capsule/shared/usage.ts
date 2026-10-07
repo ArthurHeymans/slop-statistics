@@ -5,7 +5,8 @@ export type UsageEvent = {
   total: number | null; cost: number | null; costSource: 'pi' | 'configured' | 'unknown';
   project: { key: string; name: string }; sessionId: string; title?: string | null; billingExplicit?: boolean;
 };
-export type StoredEvent = UsageEvent & { machine: string; machineName: string };
+export type StoredEvent = UsageEvent & { machine: string; machineName: string; count?: number };
+export const eventCount = (e: { count?: number }) => e.count ?? 1;
 export const MAX_BATCH = 40;
 export const billingTypes: Billing[] = ['api', 'subscription', 'local', 'unknown'];
 export const validText = (value: unknown, max: number): value is string =>
@@ -38,6 +39,7 @@ export function validateBatch(value: unknown): { machine: { id: string; name: st
     if (e.cost !== null && (typeof e.cost !== 'number' || !Number.isFinite(e.cost) || e.cost < 0 || e.cost > 1e6)) throw new Error('Invalid cost.');
     if (e.title != null && !validText(e.title, 256)) throw new Error('Invalid title.');
     if (e.billingExplicit !== undefined && typeof e.billingExplicit !== 'boolean') throw new Error('Invalid billing source.');
+    if ('count' in e) throw new Error('Collectors cannot upload summaries.');
     // Explicit allowlist: never persist extra fields, prompts, source paths, or messages.
     return { id: e.id, at: e.at, project: { key: e.project.key, name: e.project.name }, sessionId: e.sessionId,
       provider: e.provider, model: e.model, kind: e.kind, billing: e.billing, input: e.input, output: e.output,
@@ -49,16 +51,16 @@ export function validateBatch(value: unknown): { machine: { id: string; name: st
 // Positional JSON keeps Lakebed's small free database useful without losing precision.
 export function pack(e: StoredEvent): string {
   return JSON.stringify([e.id, e.at, e.machine, e.machineName, e.project.key, e.project.name, e.sessionId,
-    e.provider, e.model, e.kind, e.billing, e.input, e.output, e.cacheRead, e.cacheWrite, e.total, e.cost, e.costSource, e.title ?? null, e.billingExplicit ?? false]);
+    e.provider, e.model, e.kind, e.billing, e.input, e.output, e.cacheRead, e.cacheWrite, e.total, e.cost, e.costSource, e.title ?? null, e.billingExplicit ?? false, e.count ?? null]);
 }
 export function unpack(data: string): StoredEvent {
   let values;
   try { values = JSON.parse(data); }
   catch { throw new Error('Stored usage payload is corrupt.'); }
   const [id, at, machine, machineName, projectKey, projectName, sessionId, provider, model, kind, billing,
-    input, output, cacheRead, cacheWrite, total, cost, costSource, title, billingExplicit] = values;
+    input, output, cacheRead, cacheWrite, total, cost, costSource, title, billingExplicit, count] = values;
   return { id, at, machine, machineName, project: { key: projectKey, name: projectName }, sessionId, provider,
-    model, kind, billing, input, output, cacheRead, cacheWrite, total, cost, costSource, title, billingExplicit: billingExplicit ?? false };
+    model, kind, billing, input, output, cacheRead, cacheWrite, total, cost, costSource, title, billingExplicit: billingExplicit ?? false, ...(count == null ? {} : { count }) };
 }
 
 export type Settings = {
@@ -120,11 +122,11 @@ export const tokenCategories = [
 ] as const;
 export type TokenCategory = typeof tokenCategories[number]['key'];
 
-export function tokenBreakdown(events: readonly Pick<UsageEvent, TokenCategory>[]) {
+export function tokenBreakdown(events: readonly (Pick<UsageEvent, TokenCategory> & { count?: number })[]) {
   const categories = tokenCategories.map(category => {
     const known = events.filter(e => e[category.key] !== null);
     return { ...category, tokens: known.length ? known.reduce((sum, e) => sum + (e[category.key] ?? 0), 0) : null,
-      missing: events.length - known.length };
+      missing: events.filter(e => e[category.key] === null).reduce((sum, e) => sum + eventCount(e), 0) };
   });
   const knownTotal = categories.reduce((sum, category) => sum + (category.tokens ?? 0), 0);
   // This is a token-weighted input share, not the percentage of requests with a cache hit.
@@ -133,19 +135,19 @@ export function tokenBreakdown(events: readonly Pick<UsageEvent, TokenCategory>[
   const inputTotal = completeInput.reduce((sum, e) => sum + (e.input ?? 0) + (e.cacheRead ?? 0) + (e.cacheWrite ?? 0), 0);
   const readTotal = completeInput.reduce((sum, e) => sum + (e.cacheRead ?? 0), 0);
   return { categories, knownTotal, cacheReadShare: inputTotal > 0 ? readTotal / inputTotal : null,
-    incompleteInput: events.length - completeInput.length,
-    incompleteRecords: events.filter(e => tokenCategories.some(category => e[category.key] === null)).length };
+    incompleteInput: events.filter(e => e.input === null || e.cacheRead === null || e.cacheWrite === null).reduce((sum, e) => sum + eventCount(e), 0),
+    incompleteRecords: events.filter(e => tokenCategories.some(category => e[category.key] === null)).reduce((sum, e) => sum + eventCount(e), 0) };
 }
 
 export function metrics(events: StoredEvent[]) {
   const sum = (key: 'total' | 'input' | 'output' | 'cacheRead' | 'cacheWrite' | 'cost') => events.reduce((s, e) => s + (e[key] ?? 0), 0);
-  return { calls: events.length, tokens: sum('total'), input: sum('input'), output: sum('output'),
+  return { calls: events.reduce((s, e) => s + eventCount(e), 0), tokens: sum('total'), input: sum('input'), output: sum('output'),
     cacheRead: sum('cacheRead'), cacheWrite: sum('cacheWrite'), value: sum('cost'),
     apiSpend: events.filter(e => e.billing === 'api').reduce((s, e) => s + (e.cost ?? 0), 0),
     subscriptionValue: events.filter(e => e.billing === 'subscription').reduce((s, e) => s + (e.cost ?? 0), 0),
     unknownBillingValue: events.filter(e => e.billing === 'unknown').reduce((s, e) => s + (e.cost ?? 0), 0),
-    unpriced: events.filter(e => e.cost === null).length, unknownTokens: events.filter(e => e.total === null).length,
-    unknownBilling: events.filter(e => e.billing === 'unknown').length,
+    unpriced: events.filter(e => e.cost === null).reduce((s, e) => s + eventCount(e), 0), unknownTokens: events.filter(e => e.total === null).reduce((s, e) => s + eventCount(e), 0),
+    unknownBilling: events.filter(e => e.billing === 'unknown').reduce((s, e) => s + eventCount(e), 0),
     sessions: new Set(events.map(e => JSON.stringify([e.machine, e.sessionId]))).size };
 }
 export function group(events: StoredEvent[], key: (e: StoredEvent) => string, label = key) {

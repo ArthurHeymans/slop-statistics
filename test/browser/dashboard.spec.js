@@ -176,6 +176,22 @@ test('a different account cannot display the previous owner’s browser cache', 
   await expect(page.locator('.kpis')).toHaveCount(0);
   await expect.poll(() => page.evaluate(() => Object.keys(sessionStorage).some(key => key.startsWith('slop-statistics:history:')))).toBe(false);
 });
+test('older calls compact automatically without changing totals; session detail and cache show weighted summaries', async ({ page }) => {
+  const day = new Date(Date.parse(new Date().toISOString().slice(0, 10)) - 86400000).toISOString();
+  await backend.ingest({ machine:{id:'laptop',name:'Laptop'}, events:Array.from({length:40}, (_,i) => event('archive-' + i, 'github.com/user/alpha', day)) });
+  await page.evaluate(() => window.dispatchEvent(new Event('refresh')));
+  await expect.poll(async () => (await backend.query('metadata')).compacted).toBe(40);
+  await expect(page.getByText('Live · Lakebed free', {exact:true})).toBeVisible();
+  await expect(page.locator('.kpis')).toContainText('300 records');
+  await expect(page.locator('.kpis')).toContainText('$6.00');
+  await expect(page.getByText(/40 older calls are represented by 1 daily summaries/)).toBeVisible();
+  await page.getByRole('link', {name:'Sessions',exact:true}).click();
+  await page.locator('.panel tbody .link').first().click();
+  await expect(page.locator('.details')).toContainText('Daily summary · 40 calls');
+  await page.reload();
+  await expect(page.getByText('Live · Lakebed free', {exact:true})).toBeVisible();
+  await expect(page.locator('.kpis')).toContainText('300 records');
+});
 test('mobile layout fits and filter navigation remains usable', async ({ page }) => {
   await page.setViewportSize({ width: 390, height: 844 });
   await expect(page.getByRole('link', { name: 'Settings', exact: true })).toBeVisible();

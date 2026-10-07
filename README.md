@@ -37,7 +37,7 @@ Restart Pi or `/reload`. The extension syncs every three minutes while Pi runs. 
 
 After configuring the collector, you can alternatively install the extension with `pi install git:github.com/ArthurHeymans/slop-statistics`. Use one installation method, not both.
 
-**Free hosting limits:** 1 MiB database, 1,000 mutations/day, 10,000 requests/day. History can fill this quickly; nothing is silently pruned. Missing prices remain unknown. Export regularly.
+**Free hosting limits:** 1 MiB database, 1,000 mutations/day, 10,000 requests/day. Today's calls stay individual; older UTC days compact automatically into summaries while preserving totals and deduplication. Raw history stays locally. Storage still grows, and one busy day can fill it. Missing prices remain unknown. Back up regularly.
 
 [Accounting, configuration, privacy, testing, and recovery](docs/reference.md).
 

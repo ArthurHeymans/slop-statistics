@@ -21,6 +21,12 @@ test('history snapshots are account-scoped, replaced rather than appended, and c
   store.setItem('unrelated', 'keep'); clearHistoryCache(store);
   assert.equal(store.length, 1); assert.equal(store.getItem('unrelated'), 'keep');
 });
+test('summary snapshots preserve large totals and weighted call counts', () => {
+  const store = storage(), value = snapshot();
+  value.events[0] = { ...value.events[0], count:20, input:2e12, total:2e12 };
+  writeHistoryCache('owner', value, store); assert.deepEqual(readHistoryCache('owner', store), value);
+  value.events[0].count = -1; writeHistoryCache('owner', value, store); assert.equal(readHistoryCache('owner', store), undefined);
+});
 test('expired, corrupt, oversized and invalid snapshots are ignored and removed', () => {
   const store = storage(); writeHistoryCache('owner', snapshot(), store);
   const key = store.key(0), valid = store.getItem(key);

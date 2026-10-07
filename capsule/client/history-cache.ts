@@ -1,10 +1,12 @@
-import { pack, unpack, validateBatch, validateSettings, validText, type Settings, type StoredEvent } from '../shared/usage.ts';
+import { pack, unpack, validateSettings, validText, type Settings, type StoredEvent } from '../shared/usage.ts';
+
+import { validateStoredEvent } from '../shared/compaction.ts';
 
 export type HistorySnapshot = { events: StoredEvent[]; settings: Settings; savedAt: number };
 const prefix = 'slop-statistics:history:';
 const maxChars = 2 * 1024 * 1024; // At most ~4 MiB of UTF-16 storage; one snapshot, not a growing log.
 const maxAge = 24 * 60 * 60 * 1000;
-const key = (userId: string) => `${prefix}v1:${userId}`;
+const key = (userId: string) => `${prefix}v2:${userId}`;
 
 export function clearHistoryCache(storage?: Storage) {
   try {
@@ -19,11 +21,12 @@ export function readHistoryCache(userId: string | null, storage?: Storage): Hist
   if (!userId) return;
   try {
     const store = storage ?? sessionStorage;
+    store.removeItem(`${prefix}v1:${userId}`);
     const serialized = store.getItem(key(userId));
     if (!serialized) return;
     if (serialized.length > maxChars) throw new Error('Oversized cache.');
     const value = JSON.parse(serialized);
-    if (value.version !== 1 || !Number.isFinite(value.savedAt) || value.savedAt > Date.now() ||
+    if (value.version !== 2 || !Number.isFinite(value.savedAt) || value.savedAt > Date.now() ||
         Date.now() - value.savedAt > maxAge || !Array.isArray(value.events) || value.events.length > 16384) throw new Error('Invalid cache.');
     const events = value.events.map((data: unknown) => {
       if (typeof data !== 'string') throw new Error('Invalid cached event.');
@@ -32,9 +35,7 @@ export function readHistoryCache(userId: string | null, storage?: Storage): Hist
       return event;
     }) as StoredEvent[];
     if (new Set(events.map(event => event.id)).size !== events.length) throw new Error('Duplicate cached events.');
-    for (let i = 0; i < events.length; i += 40) {
-      validateBatch({ machine: { id: 'cache', name: 'cache' }, events: events.slice(i, i + 40) });
-    }
+    for (const event of events) validateStoredEvent(event);
     return { events, settings: validateSettings(value.settings), savedAt: value.savedAt };
   } catch {
     try { (storage ?? sessionStorage).removeItem(key(userId)); } catch { /* Optional cache. */ }
@@ -44,7 +45,7 @@ export function writeHistoryCache(userId: string | null, snapshot: HistorySnapsh
   if (!userId) return;
   try {
     const store = storage ?? sessionStorage;
-    const serialized = JSON.stringify({ version: 1, savedAt: snapshot.savedAt, settings: snapshot.settings, events: snapshot.events.map(pack) });
+    const serialized = JSON.stringify({ version: 2, savedAt: snapshot.savedAt, settings: snapshot.settings, events: snapshot.events.map(pack) });
     if (serialized.length > maxChars) { store.removeItem(key(userId)); return; }
     store.setItem(key(userId), serialized);
   } catch { /* Quota or privacy restrictions must not break the dashboard. */ }

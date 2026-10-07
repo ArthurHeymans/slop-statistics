@@ -135,14 +135,49 @@ export class Collector {
       }
     }
   }
+  async maintain() {
+    const day = new Date().toISOString().slice(0, 10);
+    for (let i = 0; i < 100; i++) {
+      const response = await fetch(`${this.config.serverUrl}/api/maintenance`, {
+        method: 'POST', headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${this.config.token}` },
+        body: JSON.stringify({ machineId: this.config.machineId }), signal: AbortSignal.timeout(8000), redirect: 'error'
+      });
+      if (response.status === 404) {
+        // Compatibility with capsules deployed before compaction was introduced.
+        this.db.prepare("INSERT OR REPLACE INTO status VALUES('maintenanceSupported','no')").run();
+      } else {
+        if (!response.ok) { this.deferQuota(response); throw new Error(`Maintenance failed (HTTP ${response.status}); records remain queued locally. ${response.status === 429 ? 'Lakebed quota reached.' : ''}`); }
+        const result = await response.json();
+        if (typeof result.more !== 'boolean') throw new Error('Invalid maintenance response; records remain queued locally.');
+        this.db.prepare("INSERT OR REPLACE INTO status VALUES('maintenanceSupported','yes')").run();
+        if (result.more) continue;
+      }
+      this.db.prepare("INSERT OR REPLACE INTO status VALUES('maintenanceDay',?)").run(day);
+      this.db.prepare("DELETE FROM status WHERE key='maintenanceNeeded'").run();
+      return;
+    }
+    throw new Error('Compaction is still pending; the next sync will continue. Records remain queued locally.');
+  }
+  deferQuota(response) {
+    const seconds = Number(response.headers.get('retry-after'));
+    if (response.status === 429 && Number.isFinite(seconds) && seconds > 0) {
+      this.db.prepare("INSERT INTO status VALUES('retryAt',?) ON CONFLICT(key) DO UPDATE SET value=excluded.value").run(String(Date.now() + Math.min(seconds, 86400) * 1000));
+    }
+  }
   async flush() {
-    // One Lakebed handler allows 100 index scans; 40 records leave headroom.
+    // Raw-ID and compacted-ID checks both fit within the 100-index-scan budget.
     const rows = this.db.prepare('SELECT id,payload FROM events WHERE sent=0 LIMIT 40').all();
     const profile = this.config.billingDefaults ? JSON.stringify(this.config.billingDefaults) : null;
     const profileChanged = profile !== null && profile !== (this.db.prepare("SELECT value FROM status WHERE key='billingProfile'").get()?.value ?? null);
-    if (!rows.length && !profileChanged) return 0; // Only send an idle request when the auth-type profile changes.
+    const day = new Date().toISOString().slice(0, 10);
+    const previousDay = this.db.prepare("SELECT value FROM status WHERE key='maintenanceDay'").get()?.value;
+    const maintenanceNeeded = Boolean(this.db.prepare("SELECT value FROM status WHERE key='maintenanceNeeded'").get()) ||
+      Boolean(previousDay && previousDay !== day) || Boolean(rows.length && previousDay !== day);
+    if (!rows.length && !profileChanged && !maintenanceNeeded) return 0;
     const retryAt = Number(this.db.prepare("SELECT value FROM status WHERE key='retryAt'").get()?.value || 0);
     if (retryAt > Date.now()) throw new Error(`Upload deferred until ${new Date(retryAt).toISOString()} (server quota).`);
+    if (maintenanceNeeded) await this.maintain();
+    if (!rows.length && !profileChanged) return 0;
     let events;
     try { events = rows.map(r => JSON.parse(r.payload)); }
     catch { throw new Error('Collector queue is corrupt. Restore the local collector database.'); }
@@ -153,10 +188,7 @@ export class Collector {
       signal: AbortSignal.timeout(8000), redirect: 'error'
     });
     if (!response.ok) {
-      const seconds = Number(response.headers.get('retry-after'));
-      if (response.status === 429 && Number.isFinite(seconds) && seconds > 0) {
-        this.db.prepare("INSERT INTO status VALUES('retryAt',?) ON CONFLICT(key) DO UPDATE SET value=excluded.value").run(String(Date.now() + Math.min(seconds, 86400) * 1000));
-      }
+      this.deferQuota(response);
       throw new Error(`Upload failed (HTTP ${response.status}). ${response.status === 429 ? 'Lakebed quota reached; records remain queued locally.' : 'Check the server URL and machine token.'}`);
     }
     const result = await response.json();
@@ -171,6 +203,9 @@ export class Collector {
         this.db.prepare("INSERT INTO status VALUES('billingProfile',?) ON CONFLICT(key) DO UPDATE SET value=excluded.value").run(profile);
       }
       this.db.prepare("DELETE FROM status WHERE key='retryAt'").run();
+      if (events.some(e => e.at.slice(0, 10) < day) && this.db.prepare("SELECT value FROM status WHERE key='maintenanceSupported'").get()?.value === 'yes') {
+        this.db.prepare("INSERT OR REPLACE INTO status VALUES('maintenanceNeeded','yes')").run();
+      }
       this.db.exec('COMMIT');
     } catch (error) { this.db.exec('ROLLBACK'); throw error; }
     this.lastError = null;
@@ -184,6 +219,7 @@ export class Collector {
         await this.scan(history, currentFile);
         let uploaded = await this.flush();
         if (drain) while (this.status().pending) uploaded += await this.flush();
+        if (this.db.prepare("SELECT value FROM status WHERE key='maintenanceNeeded'").get()) await this.maintain();
         return { uploaded, ...this.status() };
       } catch (error) { this.lastError = error.message; throw error; }
     });

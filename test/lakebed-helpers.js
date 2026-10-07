@@ -18,16 +18,21 @@ export function fixture(options = {}) {
     ingest: (body, token = env.BOOTSTRAP_UPLOAD_TOKEN) => state.transaction(db => app.endpoints.ingest.handler(context(db, createAuthContext(null)), {
       headers: new Headers({ authorization: 'Bearer ' + token }), text: async () => JSON.stringify(body)
     })).then(r => ({ status: r.result.status, ...JSON.parse(r.result.body) })),
+    maintain: (machineId = 'laptop', token = env.BOOTSTRAP_UPLOAD_TOKEN) => state.transaction(db => app.endpoints.maintenance.handler(context(db, createAuthContext(null)), {
+      headers: new Headers({ authorization: 'Bearer ' + token }), text: async () => JSON.stringify({ machineId })
+    })).then(r => ({ status: r.result.status, ...JSON.parse(r.result.body) })),
     count: () => state.read(async db => (await db.stats.withIndex('by_creation').first())?.calls ?? 0)
   };
 }
-export async function httpFixture(t) {
+export async function httpFixture(t, { maintenance = false } = {}) {
   const lakebed = fixture();
   const server = createServer(async (req, res) => {
-    if (req.url !== '/api/ingest' || req.method !== 'POST') { res.writeHead(404); res.end(); return; }
+    if ((req.url !== '/api/ingest' && !(maintenance && req.url === '/api/maintenance')) || req.method !== 'POST') { res.writeHead(404); res.end(); return; }
     try {
       const chunks = []; for await (const chunk of req) chunks.push(chunk);
-      const result = await lakebed.ingest(JSON.parse(Buffer.concat(chunks).toString()), req.headers.authorization?.slice(7));
+      const body = JSON.parse(Buffer.concat(chunks).toString());
+      const result = req.url === '/api/maintenance' ? await lakebed.maintain(body.machineId, req.headers.authorization?.slice(7)) :
+        await lakebed.ingest(body, req.headers.authorization?.slice(7));
       res.writeHead(result.status, { 'Content-Type': 'application/json' }); res.end(JSON.stringify(result));
     } catch (e) { res.writeHead(500); res.end(JSON.stringify({ error: e.message })); }
   });

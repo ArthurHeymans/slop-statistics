@@ -1,7 +1,9 @@
 import { boolean, capsule, endpoint, json, mutation, number, query, string, table, userId,
   type PaginationOptions } from 'lakebed/server';
-import { applyBillingDefaults, emptySettings, pack, unpack, validateBatch, validateBillingDefaults, validateSettings, validText, type Settings } from '../shared/usage.ts';
+import { emptySettings, pack, validateBatch, validateBillingDefaults, validateSettings, validText, type Settings } from '../shared/usage.ts';
 import { credentialDigest, requireOwner, sameSecret } from './security.ts';
+import { compactHistory, historyPage, utcStart } from './compaction.ts';
+import { ledgerContains } from '../shared/compaction.ts';
 
 function readDefaults(value: unknown) {
   try { return validateBillingDefaults(JSON.parse(String(value))); }
@@ -17,7 +19,9 @@ export default capsule({
     tokens: table({ digest: string(), label: string(), machine: string().default(''), revoked: boolean().default(false) })
       .index('by_digest', ['digest']),
     events: table({ key: string(), at: number(), data: string() }).index('by_key', ['key']).index('by_at', ['at']),
-    stats: table({ calls: number(), payloadBytes: number() }),
+    stats: table({ calls: number(), payloadBytes: number(), compacted: number().default(0), summaryRows: number().default(0) }),
+    summaries: table({ key: string(), at: number(), data: string() }).index('by_key', ['key']).index('by_at', ['at']),
+    dedup: table({ prefix: string(), tails: string() }).index('by_prefix', ['prefix']),
     machines: table({ key: string(), name: string(), billing: string() }).index('by_key', ['key'])
   },
   queries: {
@@ -36,22 +40,16 @@ export default capsule({
       catch { throw new Error('Stored dashboard settings are invalid.'); }
       return { settings, detectedBilling: machines.map(row => ({ machine: String(row.key), name: String(row.name), defaults: readDefaults(row.billing) })),
         tokens: rows.map(row => ({ id: row.id, label: String(row.label), machine: String(row.machine), revoked: Boolean(row.revoked) })),
-        calls: Number(stats?.calls ?? 0), payloadBytes: Number(stats?.payloadBytes ?? 0) };
+        calls: Number(stats?.calls ?? 0), rows: Number(stats?.calls ?? 0) - Number(stats?.compacted ?? 0) + Number(stats?.summaryRows ?? 0),
+        compacted: Number(stats?.compacted ?? 0), summaryRows: Number(stats?.summaryRows ?? 0),
+        compactionPending: Boolean(await ctx.db.events.withIndex('by_at', q => q.lt('at', utcStart())).first()),
+        payloadBytes: Number(stats?.payloadBytes ?? 0) };
     }),
-    events: query(async (ctx, args: { pagination: PaginationOptions }) => {
-      await requireOwner(ctx);
-      const pagination = args?.pagination;
-      if (!pagination || !Number.isSafeInteger(pagination.numItems) || pagination.numItems < 1 || pagination.numItems > 900) throw new Error('Invalid page size.');
-      const machines = await ctx.db.machines.withIndex('by_creation').take(40);
-      const defaults = new Map(machines.map(row => [String(row.key), readDefaults(row.billing)]));
-      const result = await ctx.db.events.withIndex('by_at').order('desc').paginate(pagination);
-      return { ...result, page: result.page.map(row => {
-        const event = unpack(String(row.data));
-        return applyBillingDefaults(event, defaults.get(event.machine) ?? {});
-      }) };
-    })
+    events: query((ctx, args: { pagination: PaginationOptions }) => historyPage(ctx, args)),
+    summaryEvents: query((ctx, args: { pagination: PaginationOptions }) => historyPage(ctx, args, true))
   },
   mutations: {
+    compact: mutation(async ctx => { await requireOwner(ctx); return compactHistory(ctx); }),
     claim: mutation(async (ctx, key: string) => {
       const account = ctx.auth.requireSignedIn();
       const expected = ctx.env.OWNER_SETUP_KEY;
@@ -80,6 +78,20 @@ export default capsule({
   },
   endpoints: {
     health: endpoint({ method: 'GET', path: '/api/health', readOnly: true }, () => json({ ok: true })),
+    maintenance: endpoint({ method: 'POST', path: '/api/maintenance', readOnly: false }, async (ctx, req) => {
+      const credential = (req.headers.get('authorization') ?? '').replace(/^Bearer /, '');
+      if (!/^slop_[A-Za-z0-9_-]{43}$/.test(credential)) return json({ error: 'Unauthorized.' }, { status: 401 });
+      const token = await ctx.db.tokens.withIndex('by_digest', q => q.eq('digest', credentialDigest(credential))).first();
+      if (token?.revoked || (!token && !sameSecret(credential, ctx.env.BOOTSTRAP_UPLOAD_TOKEN ?? ''))) return json({ error: 'Unauthorized.' }, { status: 401 });
+      let machineId;
+      try { const body = await req.text(); if (body.length > 500) throw new Error('Too large.'); machineId = JSON.parse(body).machineId; }
+      catch { return json({ error: 'Invalid maintenance request.' }, { status: 400 }); }
+      if (!validText(machineId, 100)) return json({ error: 'Invalid machine.' }, { status: 400 });
+      if (token?.machine && token.machine !== machineId) return json({ error: 'Wrong machine.' }, { status: 401 });
+      const result = await compactHistory(ctx);
+      // Control-flow only: upload credentials cannot read records or valuation.
+      return json({ more: result.more });
+    }),
     ingest: endpoint({ method: 'POST', path: '/api/ingest', readOnly: false }, async (ctx, req) => {
       const authorization = req.headers.get('authorization') ?? '';
       const credential = authorization.startsWith('Bearer ') ? authorization.slice(7) : '';
@@ -109,7 +121,14 @@ export default capsule({
         }
       }
       let inserted = 0, bytes = 0;
+      const ledgers = new Map<string, string>();
       for (const event of batch.events) {
+        const prefix = event.id.slice(0, 2);
+        if (!ledgers.has(prefix)) {
+          const ledger = await ctx.db.dedup.withIndex('by_prefix', q => q.eq('prefix', prefix)).first();
+          ledgers.set(prefix, ledger ? String(ledger.tails) : '');
+        }
+        if (ledgerContains(ledgers.get(prefix) ?? '', event.id)) continue;
         if (await ctx.db.events.withIndex('by_key', q => q.eq('key', event.id)).first()) continue;
         const data = pack({ ...event, machine: batch.machine.id, machineName: batch.machine.name });
         await ctx.db.events.insert({ key: event.id, at: Date.parse(event.at), data });

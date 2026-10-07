@@ -87,7 +87,7 @@ test('idle collectors use no mutation quota; backfills obey the 40-record limit'
   server.on('request', () => requests++);
   await collector.sync(); assert.equal(requests, 0);
   await writeFile(join(config.sessionsDir, 'many.jsonl'), lines(header, ...Array.from({ length: 91 }, (_, i) => entry('call' + i))));
-  await collector.sync({ drain: true }); assert.equal(await count(), 91); assert.equal(requests, 3);
+  await collector.sync({ drain: true }); assert.equal(await count(), 91); assert.equal(requests, 4); // One compatibility probe plus three uploads.
 });
 test('auth profiles refresh without history reimport and idle requests stop after acknowledgement', async t => {
   const { collector, config, dir, count, server } = await fixture(t); let requests = 0;
@@ -102,6 +102,29 @@ test('auth profiles refresh without history reimport and idle requests stop afte
   await collector.sync(); assert.equal(requests, 2);
   assert.ok(!JSON.stringify(collector.db.prepare('SELECT * FROM status').all()).includes('PRIVATE'));
   await writeFile(authFile, '{'); await collector.sync(); assert.equal(requests, 2);
+});
+test('daily maintenance runs after UTC midnight, survives restarts, and keeps the local raw history', async t => {
+  const now = Date.parse('2030-01-10T12:00:00.000Z');
+  t.mock.timers.enable({ apis: ['Date'], now });
+  const dir = await mkdtemp(join(tmpdir(), 'slop-maint-')); t.after(() => rm(dir, { recursive:true, force:true }));
+  const cloud = await httpFixture(t, { maintenance:true });
+  await cloud.mutate('claim', ['setup-secret']);
+  const config = { serverUrl:cloud.origin, token:cloud.token, machineId:'machine1', machineName:'Laptop',
+    sessionsDir:join(dir,'sessions'), stateDir:join(dir,'state'), enrolledAt:'2020-01-01T00:00:00.000Z', projectAliases:{'/coding':'repo/a'} };
+  await mkdir(config.sessionsDir);
+  await writeFile(join(config.sessionsDir,'day.jsonl'), lines(header, entry('today', new Date().toISOString())));
+  const collector = await Collector.open(config);
+  await collector.sync(); assert.equal((await cloud.state.dump()).tables.events.length, 1);
+  let requests = 0; cloud.server.on('request', () => requests++);
+  await collector.sync(); assert.equal(requests, 0); await collector.close();
+  t.mock.timers.setTime(now + 86400000);
+  const restarted = await Collector.open(config);
+  try {
+    await restarted.sync(); assert.equal(requests, 1);
+    const dump = await cloud.state.dump(); assert.equal(dump.tables.events.length, 0); assert.equal(dump.tables.summaries.length, 1);
+    assert.equal(restarted.db.prepare('SELECT count(*) AS n FROM events WHERE sent=1').get().n, 1);
+    await restarted.sync(); assert.equal(requests, 1);
+  } finally { await restarted.close(); }
 });
 test('daily quota Retry-After survives collector restarts', async t => {
   const { collector, config } = await fixture(t);

@@ -1,5 +1,5 @@
 import { createClient, Link, Router, SignInWithGoogle, retryAuth, signOut, useAuth, useLocation } from 'lakebed/client';
-import { useEffect, useMemo, useState } from 'preact/hooks';
+import { useEffect, useMemo, useRef, useState } from 'preact/hooks';
 import type { ComponentChildren } from 'preact';
 import type app from '../server/index.ts';
 import { billingTypes, classify, group, metrics, tokenBreakdown, tokenCategories, type Settings, type StoredEvent } from '../shared/usage.ts';
@@ -144,21 +144,37 @@ function Dashboard() {
   const view = views.find(v => location.pathname === '/' + v) ?? 'overview';
   const metadata = client.useQuery('metadata');
   const records = client.usePaginatedQuery('events', {}, { initialNumItems: 900 });
+  const summaries = client.usePaginatedQuery('summaryEvents', {}, { initialNumItems: 900 });
+  const liveEvents = useMemo(() => [...records.page, ...summaries.page].sort((a, b) => b.at.localeCompare(a.at) || a.id.localeCompare(b.id)), [records.page, summaries.page]);
+  const maintain = client.useMutation('compact');
+  const maintaining = useRef(false);
+  const [compactionError, setCompactionError] = useState('');
+  async function runCompaction() {
+    if (maintaining.current) return;
+    maintaining.current = true; setCompactionError('');
+    try {
+      for (let i = 0; i < 100; i++) { const result = await maintain(); if (!result.more) return; }
+      throw new Error('More history remains; retry to continue compaction.');
+    } catch (e) { setCompactionError(errorMessage(e)); }
+    finally { maintaining.current = false; }
+  }
+  useEffect(() => { if (metadata?.compactionPending) void runCompaction(); }, [metadata?.compactionPending]);
   const [snapshot, setSnapshot] = useState<HistorySnapshot | undefined>(() => readHistoryCache(auth.userId));
-  const incomplete = !metadata || !records.isDone || records.page.length !== metadata.calls;
+  const incomplete = !metadata || metadata.compactionPending || !records.isDone || !summaries.isDone || liveEvents.length !== metadata.rows;
   const usingCache = incomplete && Boolean(snapshot);
-  const sourceEvents = usingCache ? snapshot!.events : records.page;
+  const sourceEvents = usingCache ? snapshot!.events : liveEvents;
   const settings = metadata?.settings ?? snapshot?.settings;
   useEffect(() => { if (records.continueCursor && !records.isDone) records.loadMore(); }, [records.continueCursor, records.isDone]);
+  useEffect(() => { if (summaries.continueCursor && !summaries.isDone) summaries.loadMore(); }, [summaries.continueCursor, summaries.isDone]);
   useEffect(() => {
     if (incomplete || !metadata) return;
     // The SDK combines pages into a new array each render; only save a changed snapshot.
-    if (snapshot?.settings === metadata.settings && snapshot.events.length === records.page.length &&
-        snapshot.events.every((event, i) => event === records.page[i])) return;
-    const complete = { events: records.page, settings: metadata.settings, savedAt: Date.now() };
+    if (snapshot?.settings === metadata.settings && snapshot.events.length === liveEvents.length &&
+        snapshot.events.every((event, i) => event === liveEvents[i])) return;
+    const complete = { events: liveEvents, settings: metadata.settings, savedAt: Date.now() };
     setSnapshot(complete);
     writeHistoryCache(auth.userId, complete);
-  }, [incomplete, records.page, metadata, auth.userId, snapshot]);
+  }, [incomplete, liveEvents, metadata, auth.userId, snapshot]);
   const [metric, setMetric] = useState('tokens');
   const [period, setPeriod] = useState('30');
   const [filters, setFilters] = useState<Record<string, string>>({});
@@ -189,7 +205,7 @@ function Dashboard() {
     billing: billingTypes.map(e => [e, e])
   };
   function exportData() {
-    const url = URL.createObjectURL(new Blob([JSON.stringify({ events: records.page, settings: metadata?.settings }, null, 2)], { type: 'application/json' }));
+    const url = URL.createObjectURL(new Blob([JSON.stringify({ version: 2, events: liveEvents, settings: metadata?.settings }, null, 2)], { type: 'application/json' }));
     const link = document.createElement('a'); link.href = url; link.download = 'slop-statistics.json'; link.click(); URL.revokeObjectURL(url);
   }
   const detail = filtered.filter(e => sessionKey(e) === selectedSession);
@@ -201,7 +217,10 @@ function Dashboard() {
         <button onClick={() => setMetric(metric === 'tokens' ? 'value' : 'tokens')}>{metric === 'tokens' ? 'Show money' : 'Show tokens'}</button></div>
       {incomplete && <div className="note" role="status">{usingCache ? <>
         Showing cached totals from {new Date(snapshot!.savedAt).toLocaleString()}; refreshing in the background. These are not live totals yet.
-      </> : <>Loading {integer(records.page.length)} of {integer(metadata?.calls ?? 0)} records. Totals below are partial until loading finishes.</>}</div>}
+      </> : <>Loading {integer(liveEvents.length)} of {integer(metadata?.rows ?? 0)} stored rows. Totals below are partial until loading finishes.</>}</div>}
+      {metadata?.compactionPending && <div className="note" role="status">Compacting days before today (UTC). Totals are provisional until compaction and refresh finish.</div>}
+      {compactionError && <div className="note error" role="alert">Compaction paused: {compactionError} <button onClick={() => void runCompaction()}>Retry compaction</button></div>}
+      {metadata && metadata.compacted > 0 && <div className="note">{integer(metadata.compacted)} older calls are represented by {integer(metadata.summaryRows)} daily summaries. Today’s calls remain individual; detailed older records stay in the local collector.</div>}
       {view === 'settings' ? metadata && <SettingsPage metadata={metadata} /> : <>
         <div className="filters"><label>Period<select aria-label="Period" value={period} onChange={e => setPeriod(e.currentTarget.value)}>
           <option value="7">Last 7 days</option><option value="30">Last 30 days</option><option value="month">This month</option><option value="all">All time / custom</option></select></label>
@@ -229,8 +248,8 @@ function Dashboard() {
         {view === 'models' && <UsageTable rows={models} title="Models and providers" metric={metric} onSelect={k => select('model', k)} />}
         {view === 'machines' && <UsageTable rows={machines} title="Machines" metric={metric} onSelect={k => select('machine', k)} />}
         {view === 'sessions' && <><UsageTable rows={sessions} title="Sessions" metric={metric} onSelect={setSelectedSession} />
-          {selectedSession && <section className="details"><h2>Session calls</h2><button onClick={() => setSelectedSession('')}>Close details</button><div className="table-wrap"><table><thead><tr><th>UTC time</th><th>Model</th><th>Kind</th><th>Tokens</th><th>Estimated value</th><th>Billing</th></tr></thead>
-            <tbody>{detail.map(e => <tr key={e.id}><td>{e.at.replace('T', ' ').slice(0, 19)}</td><td>{e.model}<span className="subtext">{e.provider}</span></td><td>{e.kind}</td><td>{e.total === null ? 'Unknown' : integer(e.total)}</td><td>{e.cost === null ? 'Unknown' : money(e.cost)}</td><td>{e.billing}</td></tr>)}</tbody></table></div></section>}</>}
+          {selectedSession && <section className="details"><h2>Session calls</h2><button onClick={() => setSelectedSession('')}>Close details</button><div className="table-wrap"><table><thead><tr><th>UTC day / time</th><th>Model</th><th>Kind</th><th>Tokens</th><th>Estimated value</th><th>Billing</th></tr></thead>
+            <tbody>{detail.map(e => <tr key={e.id}><td>{e.count === undefined ? e.at.replace('T', ' ').slice(0, 19) : e.at.slice(0, 10)}</td><td>{e.model}<span className="subtext">{e.provider}</span></td><td>{e.kind}{e.count !== undefined && <span className="subtext">Daily summary · {integer(e.count)} calls</span>}</td><td>{e.total === null ? 'Unknown' : integer(e.total)}</td><td>{e.cost === null ? 'Unknown' : money(e.cost)}</td><td>{e.billing}</td></tr>)}</tbody></table></div></section>}</>}
       </>}
       <button onClick={exportData} disabled={incomplete}>Export hosted metadata</button><footer>Pi usage metadata · private Lakebed capsule · conversations stay on your machines</footer></div>
     </main></>;
@@ -255,7 +274,7 @@ function SettingsPage({ metadata }: { metadata: Metadata }) {
   }
   const text = (data: FormData, key: string) => String(data.get(key) ?? '').trim();
   return <>{error && <div className="note error" role="alert">{error}</div>}
-    <div className="note">Free plan: 1 MiB database, 1,000 mutations/day, 10,000 requests/day. Nothing is silently pruned. When storage fills, uploads roll back and stay queued locally. {integer(metadata.calls)} hosted records · {compact(metadata.payloadBytes)} characters of packed payload (not total database bytes). Export regularly; inspect exact usage with <code>npm run inspect -- --usage</code>.</div>
+    <div className="note">Free plan: 1 MiB database, 1,000 mutations/day, 10,000 requests/day. Nothing is silently pruned. When storage fills, uploads roll back and stay queued locally. {integer(metadata.calls)} hosted calls in {integer(metadata.rows)} usage rows · {compact(metadata.payloadBytes)} characters of packed payload (not total database bytes). Export regularly; inspect exact usage with <code>npm run inspect -- --usage</code>.</div>
     <Panel title="Connect a machine" copy="Each credential is upload-only and binds to its first machine."><div className="panel-body">
       <form className="form" onSubmit={event => {
         event.preventDefault(); const form = event.currentTarget as HTMLFormElement; const label = text(new FormData(form), 'label');
